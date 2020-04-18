@@ -37,8 +37,10 @@ entity Row_Controller is
 		i_mult_done : in std_logic;				--	consider again - if it's better that PE tells RC the mult is done.
 		o_PE_LB_rd_index : out std_logic_vector(c_PE_buff_idx_lngth-1 downto 0);
 	
-		--	to multiple_row_controller
-		o_load_filter_done : out std_logic;
+		-- multiple_row_controller
+		o_load_filter_done  : out std_logic;
+		o_MRC_in_ld_frst_pass  : out std_logic;
+		i_MRC_GB_available : in std_logic;
 		
 		--
 		clk : in std_logic;
@@ -57,6 +59,10 @@ architecture Behavioral of Row_Controller is
 	type READ_STATE_TYPE is (IDLE, BURST_READ, ONE_READ);
 	signal read_state : READ_STATE_TYPE;
 
+	type  FILTER_MOVE_TYPE is (SAME_ROW, LAST_ROW_EL , LAST_ROW, LAST_FILTER_EL, NEXT_ROW_FILTER, DONE);
+	signal lb_read_state : FILTER_MOVE_TYPE;
+
+
 	signal w_start_addr : std_logic_vector(g_addr_width-1 downto 0);		--	send the start address to higher level memory.
 	signal r_count_ld_inputF : integer range 0 to c_size_load_inputF-1;		--	count the number of loaded pixels to line buffer
 	
@@ -70,13 +76,17 @@ architecture Behavioral of Row_Controller is
 	signal  r_begin_index_cnt_row  : integer range 0 to c_feature_dim_1;		--  this should be exactly (c_feature_dim_1-c_filter_dim_1)
 	signal  r_cnt_filter_movement : integer range 0 to c_feature_dim_2;			--  to calculate when one filter is convolved in one input channel.
 	signal  r_LB_rd_index : integer range 0 to c_Line_Buffer_depth-1 := 0;
+	signal  r_cnt_row_filter_move : integer range 0 to c_feature_dim_2;			--  to calculate when one filter is convolved in one input channel.
+	signal  r_conv_done : std_logic := '1';
 
 	signal  r_LB_wr_index  : integer range 0 to c_Line_Buffer_depth-1;
 	signal  r_LB_wr_data_val  : std_logic := '0';	
 	signal  r_GB_end_burst : std_logic := '0' ;
 	signal  r_PE_LB_rd_index  : integer range 0 to c_PE_buff_depth-1;
+	signal  r_in_ld_frst_pass : std_logic;
+	signal  r_cnt_mult : integer range 0 to g_mult_clk-1;
+	signal  r_LB_fill_cnt : integer range 0 to c_Line_Buffer_depth-1;
 
-	signal r_cnt_mult : integer range 0 to g_mult_clk-1;
 
 	--	more than one PE - multiple PEs in one row
 	signal  r_cnt_load_filter_PE : integer range 0 to c_PE_row_dim := 0;
@@ -138,14 +148,13 @@ begin
 	if(rising_edge(clk)) then
 		if(rst='1') then
 			state <= IDLE;
-			r_cnt_sent_row <= 0;
-			r_LB_rd_index <= 0;
 			--  o_PE_input_valid <= '0';
 			r_PE_LB_rd_index <= 0;
 			r_cnt_load_filter_PE <= 0;
 			o_PE_filter_valid <= (others=>'0');
 			r_cnt_filter_movement <= 0;
 			r_count_ld_filter <= 0;
+			r_in_ld_frst_pass <= '0';
 		else
 			r_load_filter_done <= '0';
 			case state is
@@ -189,50 +198,14 @@ begin
 			when LD_BUFF =>	
 				if(r_count_ld_inputF=c_size_load_inputF-1) then
 					state <= BUFF_LOAD_SEND;
+					r_in_ld_frst_pass <= '1';
 				else
 					r_count_ld_inputF <= r_count_ld_inputF+1;
 					state <= LD_BUFF;
 				end if;
 			when BUFF_LOAD_SEND	=>					--	load the data to LB & send the loaded data from LB to PE
-				--	handle sending data.
+				r_in_ld_frst_pass <= '0';
 				state <= BUFF_WAIT_MULT;
-				if(r_cnt_sent_elm_row < g_filter_dim_1-1) then			--	until reaching the last element from the row
-					r_cnt_sent_elm_row <= r_cnt_sent_elm_row +1;
-					Incr_LB_index(r_LB_rd_index);
-				else 													--	this is the last element from this row
-					r_cnt_sent_elm_row <= 0;
-					if(r_cnt_sent_row < c_filter_dim_2-1)	then			
-						r_cnt_sent_row <= r_cnt_sent_row+1;				--	next row
-						Idx_go_next_row(r_LB_rd_index);
-					else												--	last element of this filter's position - move filter
-						r_cnt_sent_row <= 0;
-						if(r_begin_index_cnt_row= c_feature_dim_1-c_filter_dim_1) then		--  the begin index shoud go to next row
-							if(r_cnt_filter_movement = c_feature_dim_2- c_filter_dim_2) then
-								state <= IDLE;
-								r_cnt_filter_movement <= 0;
-							else
-								r_cnt_filter_movement <= r_cnt_filter_movement+1;
-							end if;
-							if(r_begin_index >= c_Line_Buffer_depth-c_filter_dim_1) then
-								r_begin_index <= c_filter_dim_1- c_Line_Buffer_depth + r_begin_index ;
-								r_LB_rd_index <= c_filter_dim_1- c_Line_Buffer_depth + r_begin_index;
-							else
-								r_begin_index <= r_begin_index+ c_filter_dim_1;
-								r_LB_rd_index <= r_begin_index+ c_filter_dim_1;
-							end if;
-							r_begin_index_cnt_row <=0;
-						else
-							r_begin_index_cnt_row <= r_begin_index_cnt_row+1;
-							if(r_begin_index = c_Line_Buffer_depth-1) then
-								r_begin_index <= 0;
-								r_LB_rd_index <= 0;
-							else
-								r_begin_index <= r_begin_index +1;
-								r_LB_rd_index <= r_begin_index +1;
-							end if;
-						end if;
-					end if;				
-				end if;
 				--o_PE_input_valid <= '1';
 				Incr_PE_LB_index(r_PE_LB_rd_index);
 			when BUFF_WAIT_MULT =>
@@ -250,8 +223,98 @@ begin
 	end process;
 
 
+	--	handle sending data from Line_buffer to PEs in one row .  the indexes of line_buffer for convolution
+	rd_index_val_to_LB : process(clk)
+	begin
+	if(rising_edge(clk)) then
+		if(rst='1') then
+			r_conv_done <= '0';
+			r_cnt_sent_row <= 0;
+			r_cnt_sent_elm_row <= 0;
+			r_begin_index <= 0;
+			r_LB_rd_index <= 0;
+		else
+			case state is
+			when BUFF_LOAD_SEND => 
+				r_conv_done <= '0';
+				case  lb_read_state is
+				when  SAME_ROW =>		-- just plus one 
+					Incr_LB_index(r_LB_rd_index);
+					--
+					r_cnt_sent_elm_row <= r_cnt_sent_elm_row +1;
+					if(r_cnt_sent_elm_row = c_filter_dim_1-2) then
+						lb_read_state <= LAST_ROW_EL;
+					else
+						lb_read_state <= SAME_ROW;
+					end if;
+				when  LAST_ROW_EL =>	--	last element of one row
+					Idx_go_next_row(r_LB_rd_index);
+					--
+					r_cnt_sent_elm_row <= 0;
+					r_cnt_sent_row <= r_cnt_sent_row+1;
+					if(r_cnt_sent_row = c_filter_dim_2-2) then
+						lb_read_state <= LAST_ROW;
+					else
+						lb_read_state <= SAME_ROW;
+					end if;
+				when  LAST_ROW =>		--	last element of last row of filter
+					Incr_LB_index(r_LB_rd_index);
+					--
+					r_cnt_sent_elm_row <= r_cnt_sent_elm_row +1;
+					if(r_cnt_sent_elm_row = c_filter_dim_1-2 and r_begin_index_cnt_row= c_feature_dim_1-c_filter_dim_1) then
+						lb_read_state <= NEXT_ROW_FILTER;
+					elsif(r_cnt_sent_elm_row = c_filter_dim_1-2) then
+						lb_read_state <= LAST_FILTER_EL;
+					else
+						lb_read_state <= LAST_ROW;
+					end if;
+				when  LAST_FILTER_EL =>		--	last element of the filter - move filter - means change the r_begin_index
+					if(r_begin_index = c_Line_Buffer_depth-1) then
+						r_begin_index <= 0;
+						r_LB_rd_index <= 0;
+					else
+						r_begin_index <= r_begin_index +1;
+						r_LB_rd_index <= r_begin_index +1;
+					end if;
+					--
+					r_cnt_sent_elm_row <=0;
+					r_cnt_sent_row <= 0;
+					r_begin_index_cnt_row <= r_begin_index_cnt_row+1;
+					-- 
+					lb_read_state <= SAME_ROW;
+				when  NEXT_ROW_FILTER =>
+					if(r_begin_index >= c_Line_Buffer_depth-c_filter_dim_1) then
+						r_begin_index <= c_filter_dim_1- c_Line_Buffer_depth + r_begin_index;
+						r_LB_rd_index <= c_filter_dim_1- c_Line_Buffer_depth + r_begin_index;
+					else
+						r_begin_index <= r_begin_index+ c_filter_dim_1;
+						r_LB_rd_index <= r_begin_index+ c_filter_dim_1;
+					end if;
+					------------
+					r_cnt_sent_elm_row <=0;
+					r_cnt_sent_row <= 0;
+					r_begin_index_cnt_row <= 0;
+					r_cnt_row_filter_move <= r_cnt_row_filter_move+1;
+					if(r_cnt_row_filter_move = c_feature_dim_2- c_filter_dim_2) then
+						r_cnt_row_filter_move <= 0;
+						lb_read_state <= DONE;
+						r_conv_done <= '1';
+					else
+						lb_read_state <= SAME_ROW;
+					end if;
+				when  DONE =>
+					r_conv_done <= '0';
+				end case;	--  lb_read_state
+			when others =>
+				
+			end case; 	--  state 
+		end if;
+	end if;
+	end process;
+
+
 	--	to line buffer, write index and write valid signals 
-	--  to GB , tell to stup the burst
+	--  to GB , tell to stop the burst
 	wr_index_val_to_LB : process(clk) 
 	begin
 	if(rising_edge(clk)) then
@@ -274,7 +337,11 @@ begin
 				end if;
 			when LD_BUFF =>
 				if(r_count_ld_inputF=c_size_load_inputF-1) then
-					read_state <= BURST_READ;
+					--read_state <= BURST_READ;			--change the next state to IDLE
+					read_state <= IDLE;
+					r_LB_wr_data_val <= '0';
+					r_GB_end_burst <= '1';
+					----------------------------
 					Incr_LB_index(r_LB_wr_index);				--	this one needs a check, if the size of GB is exactlly c_size_load_inputF
 					Incr_GB_Addr(r_addr_feature_last_read);
 				else
@@ -283,38 +350,42 @@ begin
 					Incr_LB_index(r_LB_wr_index);
 				end if;
 			when BUFF_LOAD_SEND | BUFF_WAIT_MULT =>
-				case read_state is 
-				when  IDLE =>
-					r_LB_wr_data_val <= '0';
-					r_GB_end_burst <= '0';
-					if (r_LB_wr_index < r_begin_index-1 or (r_begin_index /= 0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
-						--  an empty LB element is available now!
-						read_state <= ONE_READ; 	--  TODO_imp , in what senario it will move to BURST_READ state
-						o_GB_addr_valid <= '1';		--  tell the GB to send new data.
-						Incr_GB_Addr(r_addr_feature_last_read);
-					end if;
-				when  BURST_READ =>
-					if(r_LB_wr_index = r_begin_index-1 or (r_begin_index=0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
-						--	no empty LB 
-						read_state <= IDLE;
+				--if(i_MRC_GB_available = '0') then
+					--read_state <= IDLE;
+				--else 
+					case read_state is 
+					when  IDLE =>
 						r_LB_wr_data_val <= '0';
-						r_GB_end_burst <= '1';
-					else
-						r_LB_wr_data_val <= '1';
-						Incr_LB_index(r_LB_wr_index);
-						read_state <= BURST_READ;
-						Incr_GB_Addr(r_addr_feature_last_read);
-					end if;
-				when  ONE_READ =>
-					if(i_GB_data_ready='1') then
-						r_LB_wr_data_val <= '1';
-						Incr_LB_index(r_LB_wr_index);
-						read_state <= IDLE;
-						o_GB_addr_valid <= '0';		--  tell the GB to send new data.
-					else
-						read_state <= ONE_READ;
-					end if;
-				end case;
+						r_GB_end_burst <= '0';
+						if (r_LB_wr_index < r_begin_index-1 or (r_begin_index /= 0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
+							--  an empty LB element is available now!
+							read_state <= ONE_READ; 	--  TODO_imp , in what senario it will move to BURST_READ state
+							o_GB_addr_valid <= '1';		--  tell the GB to send new data.
+							Incr_GB_Addr(r_addr_feature_last_read);
+						end if;
+					when  BURST_READ =>
+						if(r_LB_wr_index = r_begin_index-1 or (r_begin_index=0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
+							--	no empty LB 
+							read_state <= IDLE;
+							r_LB_wr_data_val <= '0';
+							r_GB_end_burst <= '1';
+						else
+							read_state <= BURST_READ;
+							r_LB_wr_data_val <= '1';
+							Incr_LB_index(r_LB_wr_index);
+							Incr_GB_Addr(r_addr_feature_last_read);
+						end if;
+					when  ONE_READ =>
+						if(i_GB_data_ready='1') then
+							r_LB_wr_data_val <= '1';
+							Incr_LB_index(r_LB_wr_index);
+							read_state <= IDLE;
+							o_GB_addr_valid <= '0';		--  tell the GB to send new data.
+						else
+							read_state <= ONE_READ;
+						end if;
+					end case;
+				--end if;	--	end if(i_GB_available = '0')
 			when others => 
 				r_LB_wr_data_val <= '0';
 				r_GB_end_burst <= '0';
@@ -324,18 +395,19 @@ begin
 	end process;
 
 
-	-- OUTPUTS to higher memory level 
-	--o_GB_burst_addr_valid <='1'when (state=REQ_INPUT_MEM or state=REQ_FILTER_MEM) else'0';		-- tell higher memory "addres is avaliable"
-	process(o_GB_burst_addr_valid)				
+	LB_fill_up : process(clk)	-- the sensitivity list can be the r_LB_wr_index and r_begin_index , but for now clk is enough
 	begin
-		--TODO_imp, how to handle addresses, and this block probabely is not synthesizable,
-		if(state=REQ_FILTER_MEM) then
-			--o_start_addr <= (others =>'0');		--	addr for filters
-		elsif(state=REQ_INPUT_MEM) then
-			--o_start_addr <= (x"0010");			--	addr for input feature
+	if(rising_edge(clk)) then
+		if(r_begin_index < r_LB_wr_index) then
+			r_LB_fill_cnt <= c_Line_Buffer_depth - r_LB_wr_index + r_begin_index;
+		else 
+			r_LB_fill_cnt <= r_begin_index - r_LB_wr_index ;
 		end if;
+	end if;
 	end process;
 
+
+	-- OUTPUTS to higher memory level - GB
 	----
 	ld_filter_PEs : process(state, read_state)
 	begin
@@ -358,12 +430,16 @@ begin
 			o_GB_burst_addr_valid <= '0';
 		end case;
 	end process;
+	--	
+	o_GB_end_burst <= r_GB_end_burst;
+
 
 	--	OUTPUTS to line buffer
 	o_LB_data_valid <= r_LB_wr_data_val;				--	tell the LB "data from GB is ready to store".
 	o_LB_wr_index <= std_logic_vector(to_unsigned(r_LB_wr_index, o_LB_wr_index'length));
-	o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND else '0';
 	o_LB_rd_index <= std_logic_vector(to_unsigned(r_LB_rd_index, o_LB_rd_index'length));
+	o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND else '0';
+	--o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND and r_LB_fill_cnt>=c_size_load_filter else '0';
 
 
 	--	OUTPUTS to PE
@@ -371,11 +447,10 @@ begin
 	o_PE_input_valid <= '1' when state=BUFF_LOAD_SEND else '0';
 	o_PE_LB_rd_index <= std_logic_vector(to_unsigned(r_PE_LB_rd_index, o_PE_LB_rd_index'length));
 
-	--	OUTPUTS to GB
-	o_GB_end_burst <= r_GB_end_burst;
 	
 	--  OUTPUTS to Multiple_Row_Controller
 	o_load_filter_done <= r_load_filter_done;
+	o_MRC_in_ld_frst_pass <= r_in_ld_frst_pass;
 
 
 end Behavioral;
