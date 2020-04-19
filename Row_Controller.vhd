@@ -33,7 +33,7 @@ entity Row_Controller is
 
 		--	processing elements (PE)
 		o_PE_filter_valid : out std_logic_vector(c_PE_row_dim-1 downto 0);		--	tell the PE to store the buffer, the data comes from GB or DRAM
-		o_PE_input_valid : out std_logic;
+		o_PE_new_mult : out std_logic;
 		i_mult_done : in std_logic;				--	consider again - if it's better that PE tells RC the mult is done.
 		o_PE_LB_rd_index : out std_logic_vector(c_PE_buff_idx_lngth-1 downto 0);
 	
@@ -57,7 +57,7 @@ architecture Behavioral of Row_Controller is
 	signal state : STATE_TYPE;
 
 	type READ_STATE_TYPE is (IDLE, BURST_READ, ONE_READ);
-	signal read_state : READ_STATE_TYPE;
+	signal lb_write_state : READ_STATE_TYPE;
 
 	type  FILTER_MOVE_TYPE is (SAME_ROW, LAST_ROW_EL , LAST_ROW, LAST_FILTER_EL, NEXT_ROW_FILTER, DONE);
 	signal lb_read_state : FILTER_MOVE_TYPE;
@@ -86,6 +86,7 @@ architecture Behavioral of Row_Controller is
 	signal  r_in_ld_frst_pass : std_logic;
 	signal  r_cnt_mult : integer range 0 to g_mult_clk-1;
 	signal  r_LB_fill_cnt : integer range 0 to c_Line_Buffer_depth-1;
+	signal  r_LB_rd_valid : std_logic;
 
 
 	--	more than one PE - multiple PEs in one row
@@ -148,7 +149,6 @@ begin
 	if(rising_edge(clk)) then
 		if(rst='1') then
 			state <= IDLE;
-			--  o_PE_input_valid <= '0';
 			r_PE_LB_rd_index <= 0;
 			r_cnt_load_filter_PE <= 0;
 			o_PE_filter_valid <= (others=>'0');
@@ -204,11 +204,17 @@ begin
 					state <= LD_BUFF;
 				end if;
 			when BUFF_LOAD_SEND	=>					--	load the data to LB & send the loaded data from LB to PE
-				r_in_ld_frst_pass <= '0';
-				state <= BUFF_WAIT_MULT;
-				--o_PE_input_valid <= '1';
-				Incr_PE_LB_index(r_PE_LB_rd_index);
+				if(r_conv_done='1') then
+					state <= IDLE;
+				else
+					r_in_ld_frst_pass <= '0';
+					state <= BUFF_WAIT_MULT;
+					Incr_PE_LB_index(r_PE_LB_rd_index);
+				end if;				
 			when BUFF_WAIT_MULT =>
+				--if(r_conv_done='1') then
+					--state<= IDLE;
+				--els
 				if(r_cnt_mult = g_mult_clk-1) then
 					r_cnt_mult <= 0;
 					state <= BUFF_LOAD_SEND;
@@ -216,7 +222,6 @@ begin
 					r_cnt_mult <= r_cnt_mult+1;
 					state <= BUFF_WAIT_MULT;
 				end if;
-				--o_PE_input_valid <= '0';		--	TODO
 			end case;
 		end if;
 	end if;
@@ -233,7 +238,7 @@ begin
 			r_cnt_sent_elm_row <= 0;
 			r_begin_index <= 0;
 			r_LB_rd_index <= 0;
-		else
+		elsif(r_LB_rd_valid='1') then
 			case state is
 			when BUFF_LOAD_SEND => 
 				r_conv_done <= '0';
@@ -304,6 +309,9 @@ begin
 					end if;
 				when  DONE =>
 					r_conv_done <= '0';
+					r_LB_rd_index <= 0;
+					r_begin_index <= 0;
+					
 				end case;	--  lb_read_state
 			when others =>
 				
@@ -325,8 +333,12 @@ begin
 			r_addr_feature_last_read <= 64;
 		else
 			case state is
+			when IDLE =>
+				r_LB_wr_data_val <= '0';
+				r_GB_end_burst <= '0';
+				r_LB_wr_index <=0;
 			when LD_FILTER =>
-				if(r_count_ld_filter=c_size_load_filter-1) then		
+				if(r_count_ld_filter=c_size_load_filter-1) then	
 					r_GB_end_burst <= '1';		--	'1' in just one clock cycle
 				else
 					r_GB_end_burst <= '0';							-- stay in LD_FILTER
@@ -336,41 +348,39 @@ begin
 					r_LB_wr_data_val <= '1';
 				end if;
 			when LD_BUFF =>
-				if(r_count_ld_inputF=c_size_load_inputF-1) then
-					--read_state <= BURST_READ;			--change the next state to IDLE
-					read_state <= IDLE;
+				if(r_count_ld_inputF=c_size_load_inputF-1) then		--  first read pass from GB is done now
+					--lb_write_state <= BURST_READ;			
+					lb_write_state <= IDLE;	
 					r_LB_wr_data_val <= '0';
 					r_GB_end_burst <= '1';
 					----------------------------
-					Incr_LB_index(r_LB_wr_index);				--	this one needs a check, if the size of GB is exactlly c_size_load_inputF
-					Incr_GB_Addr(r_addr_feature_last_read);
+					--Incr_LB_index(r_LB_wr_index);				--	this one needs a check, if the size of GB is exactlly c_size_load_inputF
+					--Incr_GB_Addr(r_addr_feature_last_read);
 				else
 					r_LB_wr_data_val <= '1';
 					Incr_GB_Addr(r_addr_feature_last_read);
 					Incr_LB_index(r_LB_wr_index);
 				end if;
 			when BUFF_LOAD_SEND | BUFF_WAIT_MULT =>
-				--if(i_MRC_GB_available = '0') then
-					--read_state <= IDLE;
-				--else 
-					case read_state is 
+					case lb_write_state is 
 					when  IDLE =>
 						r_LB_wr_data_val <= '0';
 						r_GB_end_burst <= '0';
-						if (r_LB_wr_index < r_begin_index-1 or (r_begin_index /= 0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
+						--if (r_LB_wr_index < r_begin_index-1 or (r_begin_index /= 0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
+						if (r_LB_wr_index /= r_begin_index-1 and (r_begin_index /= 0 or r_LB_wr_index/=c_Line_Buffer_depth-1)) then
 							--  an empty LB element is available now!
-							read_state <= ONE_READ; 	--  TODO_imp , in what senario it will move to BURST_READ state
+							lb_write_state <= ONE_READ; 	--  TODO_imp , in what senario it will move to BURST_READ state
 							o_GB_addr_valid <= '1';		--  tell the GB to send new data.
 							Incr_GB_Addr(r_addr_feature_last_read);
 						end if;
 					when  BURST_READ =>
 						if(r_LB_wr_index = r_begin_index-1 or (r_begin_index=0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
 							--	no empty LB 
-							read_state <= IDLE;
+							lb_write_state <= IDLE;
 							r_LB_wr_data_val <= '0';
 							r_GB_end_burst <= '1';
 						else
-							read_state <= BURST_READ;
+							lb_write_state <= BURST_READ;
 							r_LB_wr_data_val <= '1';
 							Incr_LB_index(r_LB_wr_index);
 							Incr_GB_Addr(r_addr_feature_last_read);
@@ -379,10 +389,10 @@ begin
 						if(i_GB_data_ready='1') then
 							r_LB_wr_data_val <= '1';
 							Incr_LB_index(r_LB_wr_index);
-							read_state <= IDLE;
+							lb_write_state <= IDLE;
 							o_GB_addr_valid <= '0';		--  tell the GB to send new data.
 						else
-							read_state <= ONE_READ;
+							lb_write_state <= ONE_READ;
 						end if;
 					end case;
 				--end if;	--	end if(i_GB_available = '0')
@@ -398,18 +408,40 @@ begin
 	LB_fill_up : process(clk)	-- the sensitivity list can be the r_LB_wr_index and r_begin_index , but for now clk is enough
 	begin
 	if(rising_edge(clk)) then
-		if(r_begin_index < r_LB_wr_index) then
-			r_LB_fill_cnt <= c_Line_Buffer_depth - r_LB_wr_index + r_begin_index;
-		else 
-			r_LB_fill_cnt <= r_begin_index - r_LB_wr_index ;
+		if(r_LB_wr_index < r_begin_index) then
+			r_LB_fill_cnt <= c_Line_Buffer_depth - r_begin_index + r_LB_wr_index;
+		else
+			r_LB_fill_cnt <= r_LB_wr_index - r_begin_index;
 		end if;
 	end if;
 	end process;
 
 
+	--	read enable to read from LB
+	LB_rd_cont : process(clk)
+	begin
+	if(rising_edge(clk)) then
+		if(r_LB_wr_index < r_begin_index) then
+			if((r_LB_rd_index<=r_LB_wr_index) or (r_LB_rd_index>=r_begin_index)) then
+				r_LB_rd_valid <= '1';
+			else
+				r_LB_rd_valid <= '0';
+			end if;
+		else
+			if(r_LB_rd_index < r_LB_wr_index) then
+				r_LB_rd_valid <= '1';
+			else
+				r_LB_rd_valid <= '0';
+			end if;
+		end if;
+	end  if;
+	end  process;
+
+
+
 	-- OUTPUTS to higher memory level - GB
 	----
-	ld_filter_PEs : process(state, read_state)
+	ld_filter_PEs : process(state, lb_write_state)
 	begin
 		case state is
 		when REQ_FILTER_MEM =>
@@ -420,7 +452,7 @@ begin
 			--o_start_addr <= (x"0040");
 			o_start_addr <=  std_logic_vector(to_unsigned(r_addr_feature_last_read, o_start_addr'length)) ;
 		when BUFF_LOAD_SEND | BUFF_WAIT_MULT =>
-			case(read_state) is
+			case(lb_write_state) is
 			when ONE_READ => 
 				o_start_addr <= std_logic_vector(to_unsigned(r_addr_feature_last_read, o_start_addr'length));
 			when others =>
@@ -438,13 +470,13 @@ begin
 	o_LB_data_valid <= r_LB_wr_data_val;				--	tell the LB "data from GB is ready to store".
 	o_LB_wr_index <= std_logic_vector(to_unsigned(r_LB_wr_index, o_LB_wr_index'length));
 	o_LB_rd_index <= std_logic_vector(to_unsigned(r_LB_rd_index, o_LB_rd_index'length));
-	o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND else '0';
-	--o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND and r_LB_fill_cnt>=c_size_load_filter else '0';
+	--o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND else '0';
+	o_LB_rd_enable <= '1' when state=BUFF_LOAD_SEND and r_LB_rd_valid='1' else '0';
 
 
 	--	OUTPUTS to PE
 	w_PE_filter_valid <= '1' when state=LD_FILTER else '0';			--	tell the PE that data is coming from GB
-	o_PE_input_valid <= '1' when state=BUFF_LOAD_SEND else '0';
+	o_PE_new_mult <= '1' when state=BUFF_LOAD_SEND and r_LB_rd_valid='1' else '0';
 	o_PE_LB_rd_index <= std_logic_vector(to_unsigned(r_PE_LB_rd_index, o_PE_LB_rd_index'length));
 
 	
