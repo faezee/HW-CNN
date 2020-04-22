@@ -5,6 +5,9 @@ use work.my_pack.all;
 
 entity Row_Controller is
 	generic(
+		g_row_number : integer :=0;
+		g_LB_begin_addr : integer :=30;
+		----s
 		g_addr_width : integer := 16;
 		g_load_first : integer := 34;	-- (32+32+3)-1
 		g_load_filter : integer := 8;	-- filter size 3*3 -1
@@ -37,11 +40,11 @@ entity Row_Controller is
 		i_mult_done : in std_logic;				--	consider again - if it's better that PE tells RC the mult is done.
 		o_PE_LB_rd_index : out std_logic_vector(c_PE_buff_idx_lngth-1 downto 0);
 	
-		-- multiple_row_controller
+		-- multiple_RC
 		o_load_filter_done  : out std_logic;
-		o_MRC_in_ld_frst_pass  : out std_logic;
+		o_MRC_ld_frst_done  : out std_logic;
 		i_MRC_GB_available : in std_logic;
-		
+		o_MRC_one_ld_done : out std_logic;
 		--
 		clk : in std_logic;
 		rst : in std_logic;
@@ -75,27 +78,32 @@ architecture Behavioral of Row_Controller is
 	signal  r_begin_index : integer range 0 to c_Line_Buffer_depth;				--	where each filter begins
 	signal  r_begin_index_cnt_row  : integer range 0 to c_feature_dim_1;		--  this should be exactly (c_feature_dim_1-c_filter_dim_1)
 	signal  r_cnt_filter_movement : integer range 0 to c_feature_dim_2;			--  to calculate when one filter is convolved in one input channel.
-	signal  r_LB_rd_index : integer range 0 to c_Line_Buffer_depth-1 := 0;
 	signal  r_cnt_row_filter_move : integer range 0 to c_feature_dim_2;			--  to calculate when one filter is convolved in one input channel.
 	signal  r_conv_done : std_logic := '1';
+	signal  r_LB_rd_index : integer range 0 to c_Line_Buffer_depth-1 := 0;
 
 	signal  r_LB_wr_index  : integer range 0 to c_Line_Buffer_depth-1;
 	signal  r_LB_wr_data_val  : std_logic := '0';	
+	signal  r_LB_fill_cnt : integer range 0 to c_Line_Buffer_depth-1;
+	signal  r_LB_rd_valid : std_logic;
 	signal  r_GB_end_burst : std_logic := '0' ;
 	signal  r_PE_LB_rd_index  : integer range 0 to c_PE_buff_depth-1;
 	signal  r_in_ld_frst_pass : std_logic;
 	signal  r_cnt_mult : integer range 0 to g_mult_clk-1;
-	signal  r_LB_fill_cnt : integer range 0 to c_Line_Buffer_depth-1;
-	signal  r_LB_rd_valid : std_logic;
-
+	
+	signal  r_cnt_input_ld : integer range 0 to c_feature_dim_1*c_feature_dim_2;
+	signal  r_input_ld_done : std_logic;
 
 	--	more than one PE - multiple PEs in one row
 	signal  r_cnt_load_filter_PE : integer range 0 to c_PE_row_dim := 0;
-	type  twoD_array  is array (0 to 3) of std_logic_vector(c_addr_width-1 downto 0);
-	signal  r_addr_of_filter_in_GB : twoD_array := (x"0000", x"000A" ,x"0014" ,x"001E");
 	signal  r_addr_feature_last_read : integer range 0 to c_GB_depth-1;
 	signal  w_PE_filter_valid : std_logic;
 	signal  r_load_filter_done : std_logic;
+	signal  r_MRC_one_ld_done : std_logic;
+	type  twoD_array  is array (0 to 3) of std_logic_vector(c_addr_width-1 downto 0);
+	--signal  r_addr_of_filter_in_GB : twoD_array := (x"0000", x"000A" ,x"0014" ,x"001E");
+	signal  r_addr_of_filter_in_GB : twoD_array := (std_logic_vector(to_unsigned(g_row_number, c_addr_width)), std_logic_vector(to_unsigned(g_row_number+4, c_addr_width)), std_logic_vector(to_unsigned(g_row_number+8, c_addr_width)), std_logic_vector(to_unsigned(g_row_number+12, c_addr_width)));
+	
 
 	procedure Incr_LB_index(signal index: inout integer range 0 to c_Line_Buffer_depth-1) is
 	begin
@@ -139,8 +147,6 @@ architecture Behavioral of Row_Controller is
 			r_addr_feature_last_read <= r_addr_feature_last_read+ 1;
 		end if;
 	end procedure;
-
-	
 
 begin
 
@@ -215,9 +221,11 @@ begin
 				--if(r_conv_done='1') then
 					--state<= IDLE;
 				--els
-				if(r_cnt_mult = g_mult_clk-1) then
+				if(r_cnt_mult = g_mult_clk-1 and r_conv_done='0') then
 					r_cnt_mult <= 0;
 					state <= BUFF_LOAD_SEND;
+				elsif(r_cnt_mult = g_mult_clk-1 and r_conv_done='1') then
+					state <= IDLE;
 				else 
 					r_cnt_mult <= r_cnt_mult+1;
 					state <= BUFF_WAIT_MULT;
@@ -311,7 +319,6 @@ begin
 					r_conv_done <= '0';
 					r_LB_rd_index <= 0;
 					r_begin_index <= 0;
-					
 				end case;	--  lb_read_state
 			when others =>
 				
@@ -330,11 +337,14 @@ begin
 			r_LB_wr_index <= 0;
 			r_LB_wr_data_val <= '0';
 			o_GB_addr_valid <= '0';
-			r_addr_feature_last_read <= 64;
+			--r_addr_feature_last_read <= 64;
+			r_addr_feature_last_read <= g_LB_begin_addr;
+			r_cnt_input_ld <= 0;
 		else
 			case state is
 			when IDLE =>
 				r_LB_wr_data_val <= '0';
+				r_cnt_input_ld <= 0;
 				r_GB_end_burst <= '0';
 				r_LB_wr_index <=0;
 			when LD_FILTER =>
@@ -360,17 +370,19 @@ begin
 					r_LB_wr_data_val <= '1';
 					Incr_GB_Addr(r_addr_feature_last_read);
 					Incr_LB_index(r_LB_wr_index);
+					r_cnt_input_ld <= r_cnt_input_ld+1;
 				end if;
 			when BUFF_LOAD_SEND | BUFF_WAIT_MULT =>
 					case lb_write_state is 
 					when  IDLE =>
 						r_LB_wr_data_val <= '0';
 						r_GB_end_burst <= '0';
-						--if (r_LB_wr_index < r_begin_index-1 or (r_begin_index /= 0 and r_LB_wr_index=c_Line_Buffer_depth-1)) then
-						if (r_LB_wr_index /= r_begin_index-1 and (r_begin_index /= 0 or r_LB_wr_index/=c_Line_Buffer_depth-1)) then
+						r_MRC_one_ld_done <= '0';
+						
+						if (r_LB_wr_index /= r_begin_index-1 and (r_begin_index /= 0 or r_LB_wr_index/=c_Line_Buffer_depth-1) and r_input_ld_done='0') then
 							--  an empty LB element is available now!
 							lb_write_state <= ONE_READ; 	--  TODO_imp , in what senario it will move to BURST_READ state
-							o_GB_addr_valid <= '1';		--  tell the GB to send new data.
+							o_GB_addr_valid <= '1';			--  tell GB "send new data"
 							Incr_GB_Addr(r_addr_feature_last_read);
 						end if;
 					when  BURST_READ =>
@@ -384,18 +396,20 @@ begin
 							r_LB_wr_data_val <= '1';
 							Incr_LB_index(r_LB_wr_index);
 							Incr_GB_Addr(r_addr_feature_last_read);
+							r_cnt_input_ld <= r_cnt_input_ld+1;
 						end if;
 					when  ONE_READ =>
 						if(i_GB_data_ready='1') then
 							r_LB_wr_data_val <= '1';
+							r_MRC_one_ld_done <= '1';
 							Incr_LB_index(r_LB_wr_index);
+							r_cnt_input_ld <= r_cnt_input_ld+1;
 							lb_write_state <= IDLE;
-							o_GB_addr_valid <= '0';		--  tell the GB to send new data.
+							o_GB_addr_valid <= '0';
 						else
 							lb_write_state <= ONE_READ;
 						end if;
 					end case;
-				--end if;	--	end if(i_GB_available = '0')
 			when others => 
 				r_LB_wr_data_val <= '0';
 				r_GB_end_burst <= '0';
@@ -415,7 +429,15 @@ begin
 		end if;
 	end if;
 	end process;
-
+	
+	LB_write_done : process(clk)
+	begin 
+		if(r_cnt_input_ld=c_feature_dim_1*c_feature_dim_2-1) then
+			r_input_ld_done <= '1';
+		else
+			r_input_ld_done <= '0';
+		end if;
+	end process;
 
 	--	read enable to read from LB
 	LB_rd_cont : process(clk)
@@ -437,6 +459,7 @@ begin
 	end  if;
 	end  process;
 
+	
 
 
 	-- OUTPUTS to higher memory level - GB
@@ -482,7 +505,8 @@ begin
 	
 	--  OUTPUTS to Multiple_Row_Controller
 	o_load_filter_done <= r_load_filter_done;
-	o_MRC_in_ld_frst_pass <= r_in_ld_frst_pass;
+	o_MRC_ld_frst_done <= r_in_ld_frst_pass;
+	o_MRC_one_ld_done <= r_MRC_one_ld_done;			--  tell MRC loading to LB is done 
 
 
 end Behavioral;
